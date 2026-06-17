@@ -4,3 +4,15 @@ __pycache__/
 .env
 logs/*.log
 music/
+# Local media library and audio assets
+*.flac
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.ogg
+*.opus
+
+# Runtime artifacts
+logs/
+*.log
