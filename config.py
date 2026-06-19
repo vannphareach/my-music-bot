@@ -42,8 +42,11 @@ def load_settings() -> Settings:
         music_path = (Path(__file__).resolve().parent / music_path).resolve()
 
     ffmpeg_path = os.getenv("FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg"
-    ffmpeg_before_options = os.getenv("FFMPEG_BEFORE_OPTIONS", "-nostdin -hide_banner -loglevel warning").strip()
-    ffmpeg_options = os.getenv("FFMPEG_OPTIONS", "-vn -ac 2 -ar 48000").strip()
+    ffmpeg_before_options = os.getenv(
+        "FFMPEG_BEFORE_OPTIONS",
+        "-nostdin -hide_banner -loglevel warning -rtbufsize 150M -thread_queue_size 4096",
+    ).strip()
+    ffmpeg_options = os.getenv("FFMPEG_OPTIONS", "-vn -ac 2 -ar 48000 -bufsize 2000k -threads 2").strip()
     guild_id = _read_optional_int(os.getenv("COMMAND_SYNC_GUILD_ID"))
     bot_owner_id = _read_optional_int(os.getenv("BOT_OWNER_ID"))
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"

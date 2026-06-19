@@ -19,16 +19,16 @@ class MyDMBBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.load_extension("cogs.music")
 
+        # Always sync global commands so they are available in every server.
+        global_synced = await self.tree.sync()
+        logging.info("Synced %s global command(s)", len(global_synced))
+
+        # One-time cleanup: remove old guild-scoped duplicates if configured.
         if self.settings.command_sync_guild_id:
             guild = discord.Object(id=self.settings.command_sync_guild_id)
-            # Refresh guild commands from current source to avoid stale duplicates
             self.tree.clear_commands(guild=guild)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            logging.info("Synced %s command(s) to guild %s", len(synced), guild.id)
-        else:
-            synced = await self.tree.sync()
-            logging.info("Synced %s global command(s)", len(synced))
+            cleared = await self.tree.sync(guild=guild)
+            logging.info("Cleared %s guild-scoped command(s) in dev guild %s", len(cleared), guild.id)
 
     async def on_ready(self) -> None:
         logging.info("Bot is online as %s", self.user)

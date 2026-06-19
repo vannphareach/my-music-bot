@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from collections import deque
 from collections.abc import Callable, Coroutine
-from typing import Any
+from typing import Any, Literal
 
 import discord
 
@@ -17,6 +18,11 @@ _CONNECT_TIMEOUT_SECONDS = 45.0
 _CONNECT_RETRY_ATTEMPTS = 2
 _CONNECT_RETRY_DELAY_SECONDS = 1.0
 _IDLE_DISCONNECT_SECONDS = 600.0  # 10 minutes
+_TARGET_OPUS_BITRATE_KBPS = 96
+_LOW_BITRATE_THRESHOLD_KBPS = 64
+
+RepeatMode = Literal["off", "track", "queue"]
+EndOfQueuePolicy = Literal["announce_wait", "silent_wait", "leave_now"]
 
 
 class PlaybackError(Exception):
@@ -45,21 +51,42 @@ class GuildAudioPlayer:
         self.last_text_channel: discord.TextChannel | None = None
         self.on_playback_error: Callable[[Any, Exception], Coroutine[Any, Any, None]] | None = None
         self.on_song_start: Callable[[Any], Coroutine[Any, Any, None]] | None = None
-        self.volume: float = 0.5
+        self.volume: float = 0.70
         self._idle_task: asyncio.Task | None = None
+        self._song_started_at: float | None = None
+        self._expected_disconnect = False
+        self._skip_requested = False
+        self._track_ended = False
+        self._queue_end_announced = False
+        self._repeat_mode: RepeatMode = "off"
+        self._end_of_queue_policy: EndOfQueuePolicy = "announce_wait"
+
+    async def _ensure_self_deaf(self, voice_channel: discord.VoiceChannel) -> None:
+        """Ensure the bot is self-deaf for lower receive overhead."""
+        if not self.voice_client or not self.voice_client.is_connected():
+            return
+        try:
+            me = voice_channel.guild.me
+            if me and me.voice and me.voice.self_deaf:
+                return
+            await voice_channel.guild.change_voice_state(channel=self.voice_client.channel, self_deaf=True)
+        except Exception:
+            _LOGGER.warning("Guild %s: could not enforce self-deafen state.", self.guild_id, exc_info=True)
 
     async def connect(self, voice_channel: discord.VoiceChannel) -> None:
         if self.voice_client and self.voice_client.is_connected():
             if self.voice_client.channel and self.voice_client.channel.id != voice_channel.id:
                 await asyncio.wait_for(self.voice_client.move_to(voice_channel), timeout=_CONNECT_TIMEOUT_SECONDS)
+            await self._ensure_self_deaf(voice_channel)
             return
 
         last_error: Exception | None = None
         for attempt in range(1, _CONNECT_RETRY_ATTEMPTS + 1):
             try:
                 self.voice_client = await asyncio.wait_for(
-                    voice_channel.connect(), timeout=_CONNECT_TIMEOUT_SECONDS
+                    voice_channel.connect(self_deaf=True), timeout=_CONNECT_TIMEOUT_SECONDS
                 )
+                await self._ensure_self_deaf(voice_channel)
                 return
             except asyncio.TimeoutError as exc:
                 self.voice_client = None
@@ -93,8 +120,15 @@ class GuildAudioPlayer:
         self._cancel_idle_timer()
         self.voice_client = None
         self.current_song = None
+        self._song_started_at = None
         self._queue.clear()
         _LOGGER.warning("Guild %s: voice client cleared after unexpected disconnect.", self.guild_id)
+
+    def consume_expected_disconnect(self) -> bool:
+        """Return True once if the disconnect was initiated by this bot."""
+        expected = self._expected_disconnect
+        self._expected_disconnect = False
+        return expected
 
     def shuffle_queue(self) -> int:
         """Shuffle the pending queue in-place. Returns the new queue length."""
@@ -103,13 +137,59 @@ class GuildAudioPlayer:
         self._queue = deque(items)
         return len(self._queue)
 
+    def set_repeat_mode(self, mode: RepeatMode) -> RepeatMode:
+        if mode not in ("off", "track", "queue"):
+            mode = "off"
+        self._repeat_mode = mode
+        return self._repeat_mode
+
+    def set_end_of_queue_policy(self, policy: EndOfQueuePolicy) -> EndOfQueuePolicy:
+        if policy not in ("announce_wait", "silent_wait", "leave_now"):
+            policy = "announce_wait"
+        self._end_of_queue_policy = policy
+        return self._end_of_queue_policy
+
     def queue_snapshot(self) -> list[Song]:
         """Return a copy of the upcoming queue (not including current song)."""
         return list(self._queue)
 
+    def clear_queue(self) -> int:
+        """Clear upcoming songs (does not stop current playback)."""
+        count = len(self._queue)
+        self._queue.clear()
+        return count
+
+    async def enqueue_next(self, song: Song) -> bool:
+        """Insert a song to play immediately after current one. Returns True if started immediately."""
+        self._cancel_idle_timer()
+        self._queue.appendleft(song)
+        self._queue_end_announced = False
+        await self._start_next_if_idle()
+        return self.current_song is not None and self.current_song.path == song.path
+
+    def remove_from_queue(self, index: int) -> Song | None:
+        """Remove one song by 1-based queue index."""
+        if index < 1 or index > len(self._queue):
+            return None
+        removed: Song | None = None
+        rebuilt: deque[Song] = deque()
+        for i, item in enumerate(self._queue, start=1):
+            if i == index:
+                removed = item
+                continue
+            rebuilt.append(item)
+        self._queue = rebuilt
+        return removed
+
+    def set_volume(self, volume: float) -> float:
+        """Set player volume (applies to the next started FFmpeg Opus stream)."""
+        self.volume = max(0.0, min(2.0, volume))
+        return self.volume
+
     async def enqueue(self, song: Song) -> bool:
         """Add song to queue. Returns True if the song started playing immediately."""
         self._cancel_idle_timer()
+        self._queue_end_announced = False
         self._queue.append(song)
         await self._start_next_if_idle()
         return self.current_song is not None and self.current_song.path == song.path
@@ -128,6 +208,7 @@ class GuildAudioPlayer:
 
     async def skip(self) -> bool:
         if self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
+            self._skip_requested = True
             self.voice_client.stop()
             return True
         return False
@@ -148,14 +229,18 @@ class GuildAudioPlayer:
         self._cancel_idle_timer()
         self._queue.clear()
         self.current_song = None
+        self._song_started_at = None
 
         if self.voice_client:
             if self.voice_client.is_playing() or self.voice_client.is_paused():
+                self._skip_requested = True
                 self.voice_client.stop()
             if disconnect and self.voice_client.is_connected():
                 try:
+                    self._expected_disconnect = True
                     await self.voice_client.disconnect(force=True)
                 except Exception:
+                    self._expected_disconnect = False
                     _LOGGER.warning("Guild %s: error during voice disconnect.", self.guild_id, exc_info=True)
                 finally:
                     self.voice_client = None
@@ -181,18 +266,53 @@ class GuildAudioPlayer:
 
             if song is None:
                 self.current_song = None
+                if self._track_ended:
+                    self._track_ended = False
+                    if self._end_of_queue_policy == "leave_now":
+                        await self.stop(disconnect=True)
+                        return
+
+                    if self._end_of_queue_policy == "announce_wait" and not self._queue_end_announced and self.last_text_channel:
+                        try:
+                            mins = int(_IDLE_DISCONNECT_SECONDS // 60)
+                            await self.last_text_channel.send(
+                                f"Queue finished. Leaving voice in {mins} minutes if no new songs are queued."
+                            )
+                        except Exception:
+                            pass
+                        self._queue_end_announced = True
+
                 self._start_idle_timer()
                 return
 
             self.current_song = song
+            self._queue_end_announced = False
 
-            source = discord.FFmpegPCMAudio(
+            # Keep runtime encode load predictable to avoid stutter on busy/low-power hosts.
+            bitrate_kbps = _TARGET_OPUS_BITRATE_KBPS
+            try:
+                if self.voice_client and self.voice_client.channel:
+                    channel_limit = max(64, min(int(self.voice_client.channel.bitrate / 1000), 510))
+                    bitrate_kbps = min(_TARGET_OPUS_BITRATE_KBPS, channel_limit)
+            except Exception:
+                bitrate_kbps = _TARGET_OPUS_BITRATE_KBPS
+
+            # Let FFmpeg perform Opus encoding (and volume) instead of doing it in
+            # Python per-frame. This drastically lowers CPU on the audio thread and
+            # prevents stutter. Volume is baked into the FFmpeg audio filter.
+            base_options = self.ffmpeg_options.strip() if self.ffmpeg_options.strip() else "-vn"
+            low_bitrate_tuning = ""
+            if bitrate_kbps <= _LOW_BITRATE_THRESHOLD_KBPS:
+                # At 64kbps, prefer fewer/larger Opus frames and fixed bitrate for stability.
+                low_bitrate_tuning = " -vbr off -frame_duration 60"
+            opus_options = f"{base_options} -filter:a volume={self.volume:.3f}{low_bitrate_tuning}"
+            source = discord.FFmpegOpusAudio(
                 executable=self.ffmpeg_executable,
                 source=str(song.path),
+                bitrate=bitrate_kbps,
                 before_options=self.ffmpeg_before_options,
-                options=self.ffmpeg_options,
+                options=opus_options,
             )
-            source = discord.PCMVolumeTransformer(source, volume=self.volume)
 
             def _after_playback(error: Exception | None) -> None:
                 if error:
@@ -205,26 +325,40 @@ class GuildAudioPlayer:
 
             try:
                 self.voice_client.play(source, after=_after_playback)
+                self._song_started_at = time.monotonic()
                 _LOGGER.info(
                     "Playing '%s' in guild %s using FFmpeg options: before='%s' options='%s'",
                     song.title,
                     self.guild_id,
                     self.ffmpeg_before_options,
-                    self.ffmpeg_options,
+                    opus_options,
                 )
                 if self.on_song_start:
                     asyncio.create_task(self.on_song_start(song))
             except FileNotFoundError as exc:
                 self.current_song = None
+                self._song_started_at = None
                 raise PlaybackError(
                     "FFmpeg executable was not found. Install FFmpeg and add it to PATH, or configure FFMPEG_PATH."
                 ) from exc
             except discord.ClientException as exc:
                 self.current_song = None
+                self._song_started_at = None
                 raise PlaybackError(f"Failed to start playback: {exc}") from exc
 
     async def _playback_finished(self) -> None:
+        finished_song = self.current_song
+        should_repeat = not self._skip_requested and finished_song is not None
+        self._skip_requested = False
+
+        if should_repeat and self._repeat_mode == "track" and finished_song is not None:
+            self._queue.appendleft(finished_song)
+        elif should_repeat and self._repeat_mode == "queue" and finished_song is not None:
+            self._queue.append(finished_song)
+
+        self._track_ended = True
         self.current_song = None
+        self._song_started_at = None
         await self._start_next_if_idle()
 
     def begin_idle_countdown(self) -> bool:
@@ -309,3 +443,17 @@ class GuildAudioPlayer:
     @property
     def connect_timeout_seconds(self) -> float:
         return _CONNECT_TIMEOUT_SECONDS
+
+    @property
+    def playback_elapsed_seconds(self) -> int:
+        if self._song_started_at is None:
+            return 0
+        return max(0, int(time.monotonic() - self._song_started_at))
+
+    @property
+    def repeat_mode(self) -> RepeatMode:
+        return self._repeat_mode
+
+    @property
+    def end_of_queue_policy(self) -> EndOfQueuePolicy:
+        return self._end_of_queue_policy

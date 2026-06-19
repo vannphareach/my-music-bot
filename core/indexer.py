@@ -8,7 +8,18 @@ from pathlib import Path
 
 from mutagen._file import File as MutagenFile
 
-SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a"}
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".flac",
+    ".wav",
+    ".ogg",
+    ".m4a",
+    ".opus",
+    ".aac",
+    ".wma",
+    ".alac",
+    ".aiff",
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -68,7 +79,7 @@ class MusicLibrary:
             return []
         return [s for s in self.songs if term in s.search_text][:max(1, limit)]
 
-    def resolve_play_query(self, query: str, limit: int = 8) -> tuple[Song | None, list[Song]]:
+    def resolve_play_query(self, query: str, limit: int = 25) -> tuple[Song | None, list[Song]]:
         """Resolve play query into a unique song or a list of candidates.
 
         Returns:
