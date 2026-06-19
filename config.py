@@ -18,10 +18,11 @@ class Settings:
     ffmpeg_before_options: str
     ffmpeg_options: str
     command_sync_guild_id: int | None
+    bot_owner_id: int | None
     log_level: str
 
 
-def _read_guild_id(raw_value: str | None) -> int | None:
+def _read_optional_int(raw_value: str | None) -> int | None:
     if not raw_value:
         return None
     try:
@@ -41,9 +42,10 @@ def load_settings() -> Settings:
         music_path = (Path(__file__).resolve().parent / music_path).resolve()
 
     ffmpeg_path = os.getenv("FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg"
-    ffmpeg_before_options = os.getenv("FFMPEG_BEFORE_OPTIONS", "-nostdin").strip()
-    ffmpeg_options = os.getenv("FFMPEG_OPTIONS", "-vn").strip()
-    guild_id = _read_guild_id(os.getenv("COMMAND_SYNC_GUILD_ID"))
+    ffmpeg_before_options = os.getenv("FFMPEG_BEFORE_OPTIONS", "-nostdin -hide_banner -loglevel warning").strip()
+    ffmpeg_options = os.getenv("FFMPEG_OPTIONS", "-vn -ac 2 -ar 48000").strip()
+    guild_id = _read_optional_int(os.getenv("COMMAND_SYNC_GUILD_ID"))
+    bot_owner_id = _read_optional_int(os.getenv("BOT_OWNER_ID"))
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
 
     return Settings(
@@ -53,5 +55,6 @@ def load_settings() -> Settings:
         ffmpeg_before_options=ffmpeg_before_options,
         ffmpeg_options=ffmpeg_options,
         command_sync_guild_id=guild_id,
+        bot_owner_id=bot_owner_id,
         log_level=log_level,
     )

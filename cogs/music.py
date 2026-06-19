@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -13,12 +14,87 @@ from core.player import GuildAudioPlayer, PlaybackError
 
 
 _LOGGER = logging.getLogger(__name__)
+_VOTE_SKIP_TIMEOUT = 30  # seconds
 
 
 def _song_label(song: Song) -> str:
     if song.artist:
         return f"{song.display_title} — {song.artist}"
     return song.display_title
+
+
+class VoteSkipView(discord.ui.View):
+    def __init__(self, cog: "MusicCog", guild_id: int, needed: int, song_label: str) -> None:
+        super().__init__(timeout=_VOTE_SKIP_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.needed = needed
+        self.song_label = song_label
+        self._resolved = False
+
+    async def on_timeout(self) -> None:
+        if not self._resolved:
+            msg = self.cog._vote_skip_message.get(self.guild_id)
+            self.cog._vote_skip_votes.pop(self.guild_id, None)
+            self.cog._vote_skip_message.pop(self.guild_id, None)
+            for item in self.children:
+                item.disabled = True  # type: ignore
+            if msg:
+                try:
+                    await msg.edit(
+                        embed=self.cog._embed("Vote Skip Expired", f"Not enough votes to skip **{self.song_label}**.", 0xED4245),
+                        view=self,
+                    )
+                except Exception:
+                    pass
+
+    @discord.ui.button(label="Vote Skip", style=discord.ButtonStyle.danger, emoji="⏭️")
+    async def vote_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        guild_id = self.guild_id
+        votes: set[int] = self.cog._vote_skip_votes.get(guild_id, set())
+
+        if interaction.user.id in votes:
+            await interaction.response.send_message("You already voted to skip.", ephemeral=True)
+            return
+
+        # Must be in the same voice channel
+        player = self.cog._get_player(guild_id)
+        user_channel = MusicCog._user_voice_channel(interaction)
+        if not user_channel or not player.voice_client or user_channel.id != player.voice_client.channel.id:
+            await interaction.response.send_message("Join the voice channel to vote.", ephemeral=True)
+            return
+
+        votes.add(interaction.user.id)
+        self.cog._vote_skip_votes[guild_id] = votes
+        current = len(votes)
+
+        # Server owner or configured bot owner always forces an instant skip
+        is_owner = await self.cog._is_skip_owner(interaction)
+        if is_owner or current >= self.needed:
+            self._resolved = True
+            self.cog._vote_skip_votes.pop(guild_id, None)
+            self.cog._vote_skip_message.pop(guild_id, None)
+            for item in self.children:
+                item.disabled = True  # type: ignore
+            await player.skip()
+            if is_owner:
+                msg = f"Owner override — skipped **{self.song_label}**."
+            else:
+                msg = f"Vote passed ({current}/{self.needed}) — skipped **{self.song_label}**."
+            await interaction.response.edit_message(
+                embed=self.cog._embed("Skipped", msg, 0x57F287),
+                view=self,
+            )
+        else:
+            remaining = self.needed - current
+            await interaction.response.edit_message(
+                embed=self.cog._embed(
+                    "Vote Skip",
+                    f"**{self.song_label}**\n{current}/{self.needed} votes — need {remaining} more. ({_VOTE_SKIP_TIMEOUT}s window)",
+                    0xFEE75C,
+                ),
+                view=self,
+            )
 
 
 class PickSelect(discord.ui.Select):
@@ -84,6 +160,8 @@ class MusicCog(commands.Cog):
         self.library = MusicLibrary(self.settings.music_library_path)
         self.players: dict[int, GuildAudioPlayer] = {}
         self.pending_choices: dict[int, list[Song]] = {}
+        self._vote_skip_votes: dict[int, set[int]] = {}
+        self._vote_skip_message: dict[int, discord.Message] = {}
 
     async def cog_load(self) -> None:
         total = self.library.scan()
@@ -170,6 +248,18 @@ class MusicCog(commands.Cog):
 
         return None
 
+    async def _is_skip_owner(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild:
+            return False
+        if interaction.user.id == interaction.guild.owner_id:
+            return True
+        if self.settings.bot_owner_id is not None and interaction.user.id == self.settings.bot_owner_id:
+            return True
+        try:
+            return await self.bot.is_owner(interaction.user)
+        except Exception:
+            return False
+
     async def _play_selected_song(self, interaction: discord.Interaction, song: Song) -> None:
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
@@ -243,28 +333,32 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(embed=self._embed("Music Bot Help", "\n".join(lines), 0x5865F2), ephemeral=True)
 
     @app_commands.command(name="play", description="Play a song from your local music library")
-    @app_commands.describe(song_name="Song title or filename to search")
-    @app_commands.autocomplete(song_name=_play_autocomplete)
-    async def play(self, interaction: discord.Interaction, song_name: str) -> None:
+    @app_commands.describe(song="Song title or filename to search")
+    @app_commands.autocomplete(song=_play_autocomplete)
+    async def play(self, interaction: discord.Interaction, song: str) -> None:
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
             return
 
-        song, candidates = self.library.resolve_play_query(song_name, limit=8)
-        if not song and not candidates:
-            await interaction.response.send_message(embed=self._embed("No Match", f"No song found for '{song_name}'.", 0xED4245), ephemeral=True)
+        selected_song, candidates = self.library.resolve_play_query(song, limit=8)
+        if not selected_song and not candidates:
+            await interaction.response.send_message(embed=self._embed("No Match", f"No song found for '{song}'.", 0xED4245), ephemeral=True)
             return
 
-        if not song and candidates:
+        if not selected_song and candidates:
             self.pending_choices[interaction.guild.id] = candidates
-            lines = [f"Multiple matches for **{song_name}**. Pick from the menu below or run /pick <number>."]
+            lines = [f"Multiple matches for **{song}**. Pick from the menu below or run /pick <number>."]
             for i, item in enumerate(candidates, start=1):
                 lines.append(f"{i}. {_song_label(item)}")
             view = PickView(self, interaction.guild.id, candidates)
             await interaction.response.send_message(embed=self._embed("Choose a Song", "\n".join(lines), 0xFEE75C), view=view, ephemeral=True)
             return
 
-        await self._play_selected_song(interaction, song)
+        if selected_song is None:
+            await interaction.response.send_message("Could not resolve a unique song for this request.", ephemeral=True)
+            return
+
+        await self._play_selected_song(interaction, selected_song)
 
     @app_commands.command(name="pick", description="Choose a song from the last ambiguous /play result")
     @app_commands.describe(number="Result number from the last /play suggestions")
@@ -428,9 +522,9 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(embed=self._embed("Queue Shuffled", f"Shuffled {count} song(s).", 0x57F287))
 
     @app_commands.command(name="playlist", description="Queue all songs from a folder in your music library")
-    @app_commands.describe(folder_name="Folder name inside your music library")
-    @app_commands.autocomplete(folder_name=_playlist_autocomplete)
-    async def playlist(self, interaction: discord.Interaction, folder_name: str) -> None:
+    @app_commands.describe(folder="Folder name inside your music library")
+    @app_commands.autocomplete(folder=_playlist_autocomplete)
+    async def playlist(self, interaction: discord.Interaction, folder: str) -> None:
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
             return
@@ -440,13 +534,25 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("Join a voice channel first, then run /playlist.", ephemeral=True)
             return
 
-        songs = self.library.songs_in_folder(folder_name)
+        resolved_folder, folder_candidates = self.library.resolve_folder_query(folder)
+        songs = self.library.songs_in_folder(resolved_folder or folder)
         if not songs:
             available = self.library.list_folders()
+            if folder_candidates:
+                suggestion_list = "\n".join(f"- {f}" for f in folder_candidates)
+                await interaction.response.send_message(
+                    embed=self._embed(
+                        "Folder Not Found",
+                        f"Could not uniquely match '{folder}'. Did you mean:\n{suggestion_list}",
+                        0xED4245,
+                    ),
+                    ephemeral=True,
+                )
+                return
             if available:
                 folder_list = "\n".join(f"- {f}" for f in available)
                 await interaction.response.send_message(
-                    embed=self._embed("Folder Not Found", f"No folder named '{folder_name}'.\n{folder_list}", 0xED4245),
+                    embed=self._embed("Folder Not Found", f"No folder named '{folder}'.\n{folder_list}", 0xED4245),
                     ephemeral=True,
                 )
             else:
@@ -481,11 +587,25 @@ class MusicCog(commands.Cog):
         player.on_song_start = _prev_callback
 
         status = "Now Playing" if first_started else "Queued"
-        await interaction.followup.send(
-            embed=self._embed(status, f"{len(songs)} songs loaded from **{folder_name}**", 0x57F287)
-        )
+        per_page = 10
+        total_pages = max(1, (len(songs) + per_page - 1) // per_page)
 
-    @app_commands.command(name="skip", description="Skip the current song")
+        def make_playlist_embed(page: int) -> discord.Embed:
+            start = page * per_page
+            chunk = songs[start:start + per_page]
+            lines = [f"**{resolved_folder or folder}** — {len(songs)} song(s)\n"]
+            for idx, s in enumerate(chunk, start=start + 1):
+                prefix = "▶" if idx == 1 and first_started else f"{idx}."
+                lines.append(f"{prefix} {_song_label(s)}")
+            embed = self._embed(status, "\n".join(lines), 0x57F287)
+            embed.set_footer(text=f"Page {page + 1}/{total_pages}")
+            return embed
+
+        view = QueuePager(make_playlist_embed, total_pages)
+        view._toggle()
+        await interaction.followup.send(embed=make_playlist_embed(0), view=view)
+
+    @app_commands.command(name="skip", description="Skip the current song (owner: instant, others: vote)")
     async def skip(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
@@ -506,12 +626,126 @@ class MusicCog(commands.Cog):
             )
             return
 
-        skipped = await player.skip()
-        if not skipped:
+        if not player.current_song:
             await interaction.response.send_message("Nothing to skip.", ephemeral=True)
             return
 
-        await interaction.response.send_message(embed=self._embed("Skipped", "Skipped current song.", 0xFEE75C))
+        # Server owner or configured bot owner skips instantly
+        is_owner = await self._is_skip_owner(interaction)
+        if is_owner:
+            song_label = _song_label(player.current_song)
+            await player.skip()
+            await interaction.response.send_message(
+                embed=self._embed("Skipped", f"Owner override — skipped **{song_label}**.", 0xFEE75C)
+            )
+            return
+
+        # Everyone else: vote-skip
+        guild_id = interaction.guild.id
+        voice_channel = player.voice_client.channel if player.voice_client else None
+        if not voice_channel:
+            await interaction.response.send_message("Bot is not in a voice channel.", ephemeral=True)
+            return
+
+        listeners = [m for m in voice_channel.members if not m.bot]
+        needed = max(1, (len(listeners) // 2) + 1)
+
+        # If a vote is already active, add this user's vote
+        if guild_id in self._vote_skip_votes:
+            votes = self._vote_skip_votes[guild_id]
+            if interaction.user.id in votes:
+                await interaction.response.send_message("You already voted to skip.", ephemeral=True)
+                return
+            votes.add(interaction.user.id)
+            current = len(votes)
+            # Owner joining an active vote forces an instant skip
+            if is_owner or current >= needed:
+                self._vote_skip_votes.pop(guild_id, None)
+                self._vote_skip_message.pop(guild_id, None)
+                song_label = _song_label(player.current_song)
+                await player.skip()
+                if is_owner:
+                    msg = f"Owner override — skipped **{song_label}**."
+                else:
+                    msg = f"Vote passed ({current}/{needed}) — skipped **{song_label}**."
+                await interaction.response.send_message(
+                    embed=self._embed("Skipped", msg, 0x57F287)
+                )
+            else:
+                remaining = needed - current
+                song_label = _song_label(player.current_song)
+                await interaction.response.send_message(
+                    embed=self._embed("Vote Skip", f"**{song_label}**\n{current}/{needed} votes — need {remaining} more.", 0xFEE75C),
+                    ephemeral=True,
+                )
+            return
+
+        # Start a new vote
+        self._vote_skip_votes[guild_id] = {interaction.user.id}
+        song_label = _song_label(player.current_song)
+        view = VoteSkipView(self, guild_id, needed, song_label)
+        await interaction.response.send_message(
+            embed=self._embed(
+                "Vote Skip",
+                f"**{song_label}**\n1/{needed} votes — need {needed - 1} more. ({_VOTE_SKIP_TIMEOUT}s window)",
+                0xFEE75C,
+            ),
+            view=view,
+        )
+        msg = await interaction.original_response()
+        self._vote_skip_message[guild_id] = msg
+
+    @app_commands.command(name="skipto", description="Jump to a specific song in the queue by number or name")
+    @app_commands.describe(song="Queue position number (e.g. 3) or part of a song title")
+    async def skipto(self, interaction: discord.Interaction, song: str) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
+            return
+
+        player = self._get_player(interaction.guild.id)
+        control_error = self._control_error_message(interaction, player)
+        if control_error:
+            await interaction.response.send_message(control_error, ephemeral=True)
+            return
+
+        snapshot = player.queue_snapshot()
+        if not snapshot:
+            await interaction.response.send_message("The queue is empty.", ephemeral=True)
+            return
+
+        # Resolve by number first, then by title match
+        target_index: int | None = None
+        try:
+            n = int(song.strip())
+            if 1 <= n <= len(snapshot):
+                target_index = n
+            else:
+                await interaction.response.send_message(
+                    f"Number out of range. Queue has {len(snapshot)} song(s).", ephemeral=True
+                )
+                return
+        except ValueError:
+            needle = song.strip().lower()
+            for i, s in enumerate(snapshot, start=1):
+                if needle in s.display_title.lower() or (s.artist and needle in s.artist.lower()):
+                    target_index = i
+                    break
+            if target_index is None:
+                await interaction.response.send_message(
+                    f"No song in the queue matching **{song}**.", ephemeral=True
+                )
+                return
+
+        target_song = player.skipto(target_index)
+        if not target_song:
+            await interaction.response.send_message("Could not find that position in the queue.", ephemeral=True)
+            return
+
+        # Stop current song — player will automatically start the target next
+        await player.skip()
+        await interaction.response.send_message(
+            embed=self._embed("Skipping To", f"**{_song_label(target_song)}**", 0xFEE75C)
+        )
 
     @app_commands.command(name="stop", description="Stop playback and leave the voice channel")
     async def stop(self, interaction: discord.Interaction) -> None:
@@ -600,11 +834,11 @@ class MusicCog(commands.Cog):
         _LOGGER.info("Manual rescan completed: %s songs, %s duplicates.", total, dupes)
 
     @app_commands.command(name="search", description="Search the library by title, artist, or album")
-    @app_commands.describe(query="What to search for (title, artist, or album name)")
-    async def search(self, interaction: discord.Interaction, query: str) -> None:
-        results = self.library.search(query, limit=10)
+    @app_commands.describe(text="What to search for (title, artist, or album name)")
+    async def search(self, interaction: discord.Interaction, text: str) -> None:
+        results = self.library.search(text, limit=10)
         if not results:
-            await interaction.response.send_message(embed=self._embed("Search", f"No results for '{query}'.", 0xED4245), ephemeral=True)
+            await interaction.response.send_message(embed=self._embed("Search", f"No results for '{text}'.", 0xED4245), ephemeral=True)
             return
 
         lines = []
@@ -616,9 +850,9 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(embed=self._embed("Search Results", "\n".join(lines), 0x5865F2), ephemeral=True)
 
     @app_commands.command(name="album", description="Queue all songs from an album")
-    @app_commands.describe(album_name="Album name to queue")
-    @app_commands.autocomplete(album_name=_album_autocomplete)
-    async def album(self, interaction: discord.Interaction, album_name: str) -> None:
+    @app_commands.describe(album="Album name to queue")
+    @app_commands.autocomplete(album=_album_autocomplete)
+    async def album(self, interaction: discord.Interaction, album: str) -> None:
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True)
             return
@@ -628,10 +862,10 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("Join a voice channel first, then run /album.", ephemeral=True)
             return
 
-        songs = self.library.search_by_album(album_name)
+        songs = self.library.search_by_album(album)
         if not songs:
             await interaction.response.send_message(
-                embed=self._embed("Album Not Found", f"No album matching '{album_name}'.", 0xED4245),
+                embed=self._embed("Album Not Found", f"No album matching '{album}'.", 0xED4245),
                 ephemeral=True,
             )
             return
@@ -660,7 +894,7 @@ class MusicCog(commands.Cog):
                 first_started = True
         player.on_song_start = _prev_callback
 
-        album_display = songs[0].album or album_name
+        album_display = songs[0].album or album
         artist_display = f" by {songs[0].artist}" if songs[0].artist else ""
         status = "Now Playing" if first_started else "Queued"
         await interaction.followup.send(

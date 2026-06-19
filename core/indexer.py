@@ -62,18 +62,6 @@ class MusicLibrary:
     # Search
     # ------------------------------------------------------------------
 
-    def find(self, query: str) -> Song | None:
-        term = _normalize(query)
-        if not term:
-            return None
-        exact = next((s for s in self.songs if _normalize(s.title) == term), None)
-        if exact:
-            return exact
-        starts = next((s for s in self.songs if _normalize(s.title).startswith(term)), None)
-        if starts:
-            return starts
-        return next((s for s in self.songs if term in s.search_text), None)
-
     def search(self, query: str, limit: int = 10) -> list[Song]:
         term = _normalize(query)
         if not term:
@@ -118,20 +106,52 @@ class MusicLibrary:
 
         return None, []
 
-    def search_by_artist(self, artist: str, limit: int = 50) -> list[Song]:
-        term = _normalize(artist)
-        if not term:
-            return []
-        return [s for s in self.songs if term in _normalize(s.artist)][:max(1, limit)]
-
     def search_by_album(self, album: str) -> list[Song]:
         term = _normalize(album)
         if not term:
             return []
         return [s for s in self.songs if term in _normalize(s.album)]
 
+    def resolve_folder_query(self, query: str, limit: int = 10) -> tuple[str | None, list[str]]:
+        """Resolve folder query into one folder or candidate list.
+
+        Returns:
+        - (folder, []) when resolved uniquely
+        - (None, candidates) when multiple folders match
+        - (None, []) when nothing matches
+        """
+        term = _normalize(query)
+        if not term:
+            return None, []
+
+        folders = self.list_folders()
+
+        exact = [f for f in folders if _normalize(f) == term]
+        if len(exact) == 1:
+            return exact[0], []
+        if len(exact) > 1:
+            return None, exact[: max(1, limit)]
+
+        starts = [f for f in folders if _normalize(f).startswith(term)]
+        if len(starts) == 1:
+            return starts[0], []
+        if len(starts) > 1:
+            return None, starts[: max(1, limit)]
+
+        contains = [f for f in folders if term in _normalize(f)]
+        if len(contains) == 1:
+            return contains[0], []
+        if len(contains) > 1:
+            return None, contains[: max(1, limit)]
+
+        return None, []
+
     def songs_in_folder(self, folder_name: str) -> list[Song]:
-        needle = folder_name.strip().lower()
+        resolved, _ = self.resolve_folder_query(folder_name)
+        if not resolved:
+            return []
+
+        needle = resolved.strip().lower()
         return [
             s for s in self.songs
             if s.relative_path.lower().startswith(needle + "\\")

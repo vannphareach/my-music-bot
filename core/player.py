@@ -13,7 +13,9 @@ from core.indexer import Song
 
 
 _LOGGER = logging.getLogger(__name__)
-_CONNECT_TIMEOUT_SECONDS = 30.0
+_CONNECT_TIMEOUT_SECONDS = 45.0
+_CONNECT_RETRY_ATTEMPTS = 2
+_CONNECT_RETRY_DELAY_SECONDS = 1.0
 _IDLE_DISCONNECT_SECONDS = 600.0  # 10 minutes
 
 
@@ -49,18 +51,42 @@ class GuildAudioPlayer:
     async def connect(self, voice_channel: discord.VoiceChannel) -> None:
         if self.voice_client and self.voice_client.is_connected():
             if self.voice_client.channel and self.voice_client.channel.id != voice_channel.id:
-                await self.voice_client.move_to(voice_channel)
+                await asyncio.wait_for(self.voice_client.move_to(voice_channel), timeout=_CONNECT_TIMEOUT_SECONDS)
             return
 
-        try:
-            self.voice_client = await asyncio.wait_for(
-                voice_channel.connect(), timeout=_CONNECT_TIMEOUT_SECONDS
-            )
-        except asyncio.TimeoutError as exc:
-            self.voice_client = None
-            raise PlaybackError(
-                f"Could not connect to voice channel within {_CONNECT_TIMEOUT_SECONDS:.0f} seconds."
-            ) from exc
+        last_error: Exception | None = None
+        for attempt in range(1, _CONNECT_RETRY_ATTEMPTS + 1):
+            try:
+                self.voice_client = await asyncio.wait_for(
+                    voice_channel.connect(), timeout=_CONNECT_TIMEOUT_SECONDS
+                )
+                return
+            except asyncio.TimeoutError as exc:
+                self.voice_client = None
+                last_error = exc
+                _LOGGER.warning(
+                    "Guild %s: voice connect timeout (attempt %s/%s).",
+                    self.guild_id,
+                    attempt,
+                    _CONNECT_RETRY_ATTEMPTS,
+                )
+            except discord.ClientException as exc:
+                self.voice_client = None
+                last_error = exc
+                _LOGGER.warning(
+                    "Guild %s: voice connect failed (attempt %s/%s): %s",
+                    self.guild_id,
+                    attempt,
+                    _CONNECT_RETRY_ATTEMPTS,
+                    exc,
+                )
+
+            if attempt < _CONNECT_RETRY_ATTEMPTS:
+                await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+
+        raise PlaybackError(
+            f"Could not connect to voice channel after {_CONNECT_RETRY_ATTEMPTS} attempt(s)."
+        ) from last_error
 
     def handle_disconnect(self) -> None:
         """Call when the bot is force-kicked so stale state is cleared."""
@@ -105,6 +131,18 @@ class GuildAudioPlayer:
             self.voice_client.stop()
             return True
         return False
+
+    def skipto(self, index: int) -> Song | None:
+        """Drop all songs before 1-based *index* in the queue so it plays next.
+
+        Returns the target Song on success, or None if index is out of range.
+        """
+        if index < 1 or index > len(self._queue):
+            return None
+        # Remove the songs that come before the target (index is 1-based)
+        for _ in range(index - 1):
+            self._queue.popleft()
+        return self._queue[0]
 
     async def stop(self, disconnect: bool) -> None:
         self._cancel_idle_timer()
